@@ -4,10 +4,16 @@
 
 This project consists of a Python-based API endpoint designed to rapidly deliver the current economic calendar of events in JSON format, often utilized within the Forex market.
 
-It uses the documented Trading Economics economic-calendar API. Set the
-`TRADING_ECONOMICS_API_KEY` environment variable to a valid key; do not commit it.
-The service caches valid responses and remains healthy when the provider is
-temporarily unavailable.
+It uses Economicium's free, keyless JSON economic-release calendar:
+`https://www.economicium.com/data/economic-calendar.json`. The data is compiled
+from official national statistics agencies and central-bank release schedules.
+It includes the published event date/time, country and impact; it deliberately
+does not redistribute commercial consensus forecasts or live release results, so
+`actual`, `forecast`, and `previous` are returned as `null`.
+
+No API key, subscription, or credit card is required. Responses are cached for
+six hours (configurable) and stale real data can be served for seven days during
+a provider outage.
 
 The API has been intentionally developed with simplicity in mind, both in terms of maintenance and usability, ensuring that it remains straightforward to integrate into various applications.
 
@@ -22,7 +28,6 @@ python -m venv .venv
 # Windows PowerShell: .venv\\Scripts\\Activate.ps1
 # macOS/Linux: source .venv/bin/activate
 python -m pip install -r requirements.txt
-set TRADING_ECONOMICS_API_KEY=your-key # PowerShell: $env:TRADING_ECONOMICS_API_KEY="your-key"
 python app.py
 ```
 
@@ -39,13 +44,15 @@ And you will see a JSON response like this:
   "success": true,
   "data": [
     {
-    "economy": "NZD",
-    "impact": 1,
-    "data": "2018-09-09 22:45:00",
-    "name": "Manufacturing Sales Volume (QoQ) (Q2)",
-    "actual": "-1.2%",
-    "forecast": "",
-    "previous": "1.4%"
+    "economy": "USD",
+    "impact": 3,
+    "data": "2026-08-26 12:30:00",
+    "name": "US GDP (Gross Domestic Product)",
+    "actual": null,
+    "forecast": null,
+    "previous": null,
+    "country": "United States",
+    "currency": "USD"
     }
   ]
 }
@@ -59,11 +66,15 @@ the Render Dashboard instead, create a **Web Service** and set:
 - Build command: `pip install -r requirements.txt`
 - Start command: `gunicorn app:app --bind 0.0.0.0:$PORT`
 - Health-check path: `/healthz`
-- Secret environment variable: `TRADING_ECONOMICS_API_KEY`
+- No provider secret is required.
 
 `GET` and `HEAD /healthz` always return `200` without calling the calendar
 provider. `GET /` returns cached data during a transient provider failure, or a
 safe JSON `503` response with an empty `data` list when no cache is available.
+
+Economicium publishes its JSON files without a key or documented rate limit;
+the six-hour cache keeps this service well below reasonable-use traffic. HTTP
+429 honours `Retry-After` and otherwise backs off before another provider call.
 
 ## Demo
 A demo available is [here](https://andrevlimawebh.000webhostapp.com/) (Can be broken, free server can be deleted)

@@ -14,19 +14,16 @@ from flask import Flask, Response, jsonify, request
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-API_URL = "https://api.tradingeconomics.com/calendar"
+from calendar_provider import CalendarProviderError, EconomiciumProvider
+
 REQUEST_TIMEOUT_SECONDS = float(os.getenv("CALENDAR_REQUEST_TIMEOUT_SECONDS", "10"))
-CACHE_TTL_SECONDS = int(os.getenv("CALENDAR_CACHE_TTL_SECONDS", "900"))
-STALE_CACHE_TTL_SECONDS = int(os.getenv("CALENDAR_STALE_CACHE_TTL_SECONDS", "86400"))
-FAILURE_BACKOFF_SECONDS = int(os.getenv("CALENDAR_FAILURE_BACKOFF_SECONDS", "60"))
+CACHE_TTL_SECONDS = int(os.getenv("CALENDAR_CACHE_TTL_SECONDS", "21600"))
+STALE_CACHE_TTL_SECONDS = int(os.getenv("CALENDAR_STALE_CACHE_TTL_SECONDS", "604800"))
+FAILURE_BACKOFF_SECONDS = int(os.getenv("CALENDAR_FAILURE_BACKOFF_SECONDS", "120"))
 
 app = Flask(__name__)
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper())
 logger = logging.getLogger(__name__)
-
-
-class CalendarProviderError(Exception):
-    """A safe, public-facing error from the calendar provider."""
 
 
 @dataclass
@@ -43,7 +40,7 @@ next_provider_attempt_at = 0.0
 def build_http_session() -> requests.Session:
     """Retry transient upstream failures a small, bounded number of times."""
     retry = Retry(total=2, connect=2, read=2, status=2, backoff_factor=0.5,
-                  status_forcelist=(429, 500, 502, 503, 504),
+                  status_forcelist=(500, 502, 503, 504),
                   allowed_methods=frozenset(("GET",)), raise_on_status=False)
     session = requests.Session()
     session.mount("https://", HTTPAdapter(max_retries=retry))
@@ -51,65 +48,12 @@ def build_http_session() -> requests.Session:
 
 
 http = build_http_session()
-
-
-def _string_or_none(value: Any) -> str | None:
-    return None if value is None else str(value).strip()
-
-
-def normalize_events(payload: Any) -> list[dict[str, Any]]:
-    """Validate Trading Economics JSON and retain the legacy event field names."""
-    if not isinstance(payload, list):
-        raise CalendarProviderError("Calendar provider returned invalid data")
-
-    events: list[dict[str, Any]] = []
-    for item in payload:
-        if not isinstance(item, dict):
-            raise CalendarProviderError("Calendar provider returned invalid data")
-        name = _string_or_none(item.get("Event")) or _string_or_none(item.get("Category"))
-        if name is None:
-            raise CalendarProviderError("Calendar provider returned invalid data")
-        try:
-            impact = int(item.get("Importance", 0) or 0)
-        except (TypeError, ValueError) as error:
-            raise CalendarProviderError("Calendar provider returned invalid data") from error
-        events.append({
-            "economy": _string_or_none(item.get("Currency")) or _string_or_none(item.get("Country")) or "",
-            "impact": impact,
-            "data": _string_or_none(item.get("Date")),
-            "name": name,
-            "actual": _string_or_none(item.get("Actual")),
-            "forecast": _string_or_none(item.get("Forecast")),
-            "previous": _string_or_none(item.get("Previous")),
-        })
-    return events
+provider = EconomiciumProvider()
 
 
 def fetch_calendar() -> list[dict[str, Any]]:
-    """Fetch and validate fresh data without leaking provider errors to clients."""
-    api_key = os.getenv("TRADING_ECONOMICS_API_KEY")
-    if not api_key:
-        logger.error("Calendar provider is not configured: TRADING_ECONOMICS_API_KEY is missing")
-        raise CalendarProviderError("Economic calendar provider temporarily unavailable")
-    try:
-        response = http.get(API_URL, params={"c": api_key, "f": "json"},
-                            headers={"Accept": "application/json"}, timeout=REQUEST_TIMEOUT_SECONDS)
-        if response.status_code in (403, 429) or response.status_code >= 500:
-            logger.warning("Calendar provider returned HTTP %s", response.status_code)
-        response.raise_for_status()
-        return normalize_events(response.json())
-    except requests.exceptions.Timeout as error:
-        logger.warning("Calendar provider request timed out")
-        raise CalendarProviderError("Economic calendar provider temporarily unavailable") from error
-    except requests.exceptions.HTTPError as error:
-        logger.warning("Calendar provider request failed with HTTP %s", error.response.status_code)
-        raise CalendarProviderError("Economic calendar provider temporarily unavailable") from error
-    except requests.exceptions.RequestException as error:
-        logger.warning("Calendar provider request failed: %s", error.__class__.__name__)
-        raise CalendarProviderError("Economic calendar provider temporarily unavailable") from error
-    except (TypeError, ValueError, CalendarProviderError) as error:
-        logger.warning("Calendar provider returned invalid data")
-        raise CalendarProviderError("Economic calendar provider temporarily unavailable") from error
+    """Fetch real events through the provider boundary."""
+    return provider.fetch_calendar(http, REQUEST_TIMEOUT_SECONDS)
 
 
 def calendar_data() -> tuple[list[dict[str, Any]] | None, str, bool]:
@@ -125,9 +69,10 @@ def calendar_data() -> tuple[list[dict[str, Any]] | None, str, bool]:
             return None, "unavailable", False
     try:
         fresh_data = fetch_calendar()
-    except CalendarProviderError:
+    except CalendarProviderError as error:
         with cache_lock:
-            next_provider_attempt_at = time.monotonic() + FAILURE_BACKOFF_SECONDS
+            retry_after = error.retry_after if error.retry_after is not None else FAILURE_BACKOFF_SECONDS
+            next_provider_attempt_at = time.monotonic() + max(FAILURE_BACKOFF_SECONDS, retry_after)
             if cache and now - cache.fetched_at < STALE_CACHE_TTL_SECONDS:
                 return cache.data, "stale_cache", True
         return None, "unavailable", False
@@ -138,9 +83,9 @@ def calendar_data() -> tuple[list[dict[str, Any]] | None, str, bool]:
 
 
 @app.route("/healthz", methods=("GET", "HEAD"))
-def healthz() -> Response:
+def healthz() -> tuple[dict[str, str], int]:
     """Render liveness endpoint; deliberately independent of the data provider."""
-    return jsonify({"status": "ok"})
+    return {"status": "ok"}, 200
 
 
 @app.route("/", methods=("GET", "HEAD"))
